@@ -4,9 +4,10 @@ import { Observable } from 'rxjs/Observable'
 import { RequestEvent } from 'snapper-consumer'
 import { Database } from 'reactivedb'
 import { Net } from '../Net'
-import { MessageResult, eventParser } from './EventParser'
-import Dirty from '../utils/Dirty'
+import { eventParser } from './EventParser'
 import { TableInfoByMessageType } from './MapToTable'
+import { Interceptors, Proxy, ControlFlow } from './Middleware'
+import { WSMsgResult, WSMsgHandler, WSMsgToDBHandler } from '../utils'
 
 const methodMap: any = {
   'change': 'upsert',
@@ -15,33 +16,39 @@ const methodMap: any = {
   'remove': 'delete'
 }
 
+export const createMsgHandler = (
+  proxy: Proxy = new Proxy()
+) => (
+  msg: WSMsgResult
+): Observable<any> => {
+  proxy.apply(msg)
+  return Observable.of(null)
+}
+
 /**
  * refresh 事件需要逐个单独处理
  * destroy 事件没有 data
  */
-export const handleMsgToDb = (
+export const createMsgToDBHandler = (
+  proxyWithDB: Interceptors = new Interceptors()
+) => (
   db: Database,
-  msg: MessageResult,
+  msg: WSMsgResult,
   tableName: string,
   pkName: string
 ): Observable<any> => {
-
   const { method, id, data } = msg
   const dbMethod = db[methodMap[method]]
-  let dirtyStream: Observable<any> | null
+
+  const ret = proxyWithDB.apply(msg, db, tableName, pkName)
+  if (ret === ControlFlow.IgnoreDefaultDBOps) {
+    return Observable.of(null)
+  }
 
   switch (method) {
     case 'new':
-      dirtyStream = Dirty.handleSocketMessage(id, tableName, data, db)
-      if (dirtyStream) {
-        return dirtyStream
-      }
       return dbMethod.call(db, tableName, data)
     case 'change':
-      dirtyStream = Dirty.handleSocketMessage(id, tableName, data, db)
-      if (dirtyStream) {
-        return dirtyStream
-      }
       return dbMethod.call(db, tableName,
         Array.isArray(data) ? data : { ...data, [pkName]: id }
       )
@@ -61,6 +68,8 @@ export const handleMsgToDb = (
 export function socketHandler(
   net: Net,
   event: RequestEvent,
+  handleMsgToDB: WSMsgToDBHandler,
+  handleMsg: WSMsgHandler,
   mapToTable: TableInfoByMessageType,
   db?: Database
 ): Observable<any> {
@@ -69,17 +78,17 @@ export function socketHandler(
   const signals = parsedMsgs.map((msg) => {
     const tabInfo = mapToTable.getTableInfo(msg.type)
 
-    if (!tabInfo) {
-      return Observable.of(null)
+    if (!tabInfo) { // todo: 判断 message method 是否有对应的 db 操作
+      return handleMsg(msg)
     }
 
     const { tabName, pkName } = tabInfo
 
     if (!db) {
-      net.bufferSocketPush(tabName, msg, pkName, msg.type)
+      net.bufferSocketPush(tabName, msg, pkName)
       return Observable.of(null)
     } else {
-      return handleMsgToDb(db, msg, tabName, pkName)
+      return handleMsgToDB(db, msg, tabName, pkName)
     }
   })
 
